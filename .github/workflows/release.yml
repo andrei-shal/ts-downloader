@@ -1,0 +1,93 @@
+# Builds binaries for Linux, Windows and macOS on native runners and publishes a GitHub release.
+# Trigger: push a tag like v0.1.0.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, name: linux-amd64 }
+          - { os: ubuntu-24.04-arm, name: linux-arm64 }
+          - { os: windows-latest, name: windows-amd64 }
+          - { os: macos-latest, name: macos-universal }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+
+      - name: Test
+        run: go test ./internal/pattern ./internal/downloader
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            Linux)
+              go build -trimpath -ldflags "-s -w" -o dist/ts-downloader .
+              tar -czf "ts-downloader-${{ matrix.name }}.tar.gz" -C dist ts-downloader
+              ;;
+            Windows)
+              # -H windowsgui: no console window behind the app
+              go build -trimpath -ldflags "-s -w -H windowsgui" -o dist/ts-downloader.exe .
+              7z a "ts-downloader-${{ matrix.name }}.zip" ./dist/ts-downloader.exe
+              ;;
+            macOS)
+              # Build both architectures and merge into one universal binary.
+              CGO_ENABLED=1 GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/arm64 .
+              CGO_ENABLED=1 GOARCH=amd64 CC="clang -arch x86_64" go build -trimpath -ldflags "-s -w" -o dist/amd64 .
+              lipo -create -output dist/ts-downloader dist/arm64 dist/amd64
+              tar -czf "ts-downloader-${{ matrix.name }}.tar.gz" -C dist ts-downloader
+              ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ts-downloader-${{ matrix.name }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out && sha256sum * > SHA256SUMS.txt
+          cat > ../notes.md <<'EOF'
+          Скачайте архив под свою систему, распакуйте и запустите `ts-downloader`.
+
+          **Нужен ffmpeg** (для склейки в mp4):
+          - Linux: `sudo pacman -S ffmpeg` / `sudo apt install ffmpeg`
+          - macOS: `brew install ffmpeg`
+          - Windows: `winget install ffmpeg`, либо укажите путь к `ffmpeg.exe` в окне программы
+
+          **macOS:** бинарник не подписан. Если система не даёт его открыть, выполните
+          `xattr -d com.apple.quarantine ts-downloader`.
+          EOF
+          gh release create "${{ github.ref_name }}" * \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes-file ../notes.md
