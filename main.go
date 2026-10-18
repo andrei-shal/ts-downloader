@@ -20,13 +20,14 @@ import (
 	"ts-downloader/internal/downloader"
 	"ts-downloader/internal/merge"
 	"ts-downloader/internal/pattern"
+	"ts-downloader/internal/subs"
 )
 
 func main() {
 	a := app.NewWithID("dev.tsdownloader")
 	w := a.NewWindow("TS Downloader")
 	newUI(a, w)
-	w.Resize(fyne.NewSize(720, 640))
+	w.Resize(fyne.NewSize(760, 820))
 	w.ShowAndRun()
 }
 
@@ -37,11 +38,14 @@ type ui struct {
 	base, tmpl, pad, start, end, workers *widget.Entry
 	headers, outDir, outName, ffmpeg     *widget.Entry
 	cleanup                              *widget.Check
+	subsOn, translate                    *widget.Check
+	lang                                 *widget.Select
+	model, whisper                       *widget.Entry
 	preview, status, logText             *widget.Label
 	logScroll                            *container.Scroll
 	bar                                  *widget.ProgressBar
 	barInf                               *widget.ProgressBarInfinite
-	startBtn, stopBtn                    *widget.Button
+	startBtn, stopBtn, subsBtn           *widget.Button
 
 	cancel context.CancelFunc
 }
@@ -79,6 +83,26 @@ func newUI(a fyne.App, w fyne.Window) {
 	u.cleanup = widget.NewCheck("Удалить сегменты после склейки", func(b bool) { u.prefs.SetBool("cleanup", b) })
 	u.cleanup.SetChecked(u.prefs.BoolWithFallback("cleanup", true))
 
+	u.model = entry("model", "путь к ggml-*.bin", "")
+	u.whisper = entry("whisper", "пусто = whisper-cli из PATH", "")
+	check := func(key, text string, def bool) *widget.Check {
+		c := widget.NewCheck(text, func(b bool) { u.prefs.SetBool(key, b) })
+		c.SetChecked(u.prefs.BoolWithFallback(key, def))
+		return c
+	}
+	u.subsOn = check("subsOn", "Сгенерировать субтитры (Whisper) и вшить в mp4", false)
+	u.translate = check("translate", "Перевести на английский", false)
+	u.lang = widget.NewSelect([]string{"auto", "en", "ru"}, func(s string) { u.prefs.SetString("lang", s) })
+	u.lang.SetSelected(u.prefs.StringWithFallback("lang", "auto"))
+	browseModel := widget.NewButton("Выбрать…", func() {
+		dialog.ShowFileOpen(func(f fyne.URIReadCloser, err error) {
+			if err == nil && f != nil {
+				u.model.SetText(f.URI().Path())
+				f.Close()
+			}
+		}, w)
+	})
+
 	browse := widget.NewButton("Выбрать…", func() {
 		dialog.ShowFolderOpen(func(dir fyne.ListableURI, err error) {
 			if err == nil && dir != nil {
@@ -106,6 +130,7 @@ func newUI(a fyne.App, w fyne.Window) {
 		}
 	})
 	u.stopBtn.Disable()
+	u.subsBtn = widget.NewButton("Субтитры к готовому mp4", u.onSubsOnly)
 
 	form := widget.NewForm(
 		widget.NewFormItem("Base URL", u.base),
@@ -119,11 +144,15 @@ func newUI(a fyne.App, w fyne.Window) {
 		widget.NewFormItem("Файл", u.outName),
 		widget.NewFormItem("ffmpeg", u.ffmpeg),
 		widget.NewFormItem("", u.cleanup),
+		widget.NewFormItem("Субтитры", u.subsOn),
+		widget.NewFormItem("Язык речи", container.NewHBox(u.lang, u.translate)),
+		widget.NewFormItem("Модель", container.NewBorder(nil, nil, nil, browseModel, u.model)),
+		widget.NewFormItem("whisper-cli", u.whisper),
 	)
 
 	top := container.NewVBox(
 		form,
-		container.NewGridWithColumns(2, u.startBtn, u.stopBtn),
+		container.NewGridWithColumns(3, u.startBtn, u.subsBtn, u.stopBtn),
 		u.status,
 		container.NewStack(u.bar, u.barInf),
 	)
@@ -196,7 +225,9 @@ type job struct {
 	ffmpeg  string
 	out     string
 	cleanup bool
-	total   int // 0 when the end is unknown
+	total   int           // 0 when the end is unknown
+	subs    *subs.Options // nil = no subtitles
+	only    bool          // only subtitles for an existing mp4, no download
 }
 
 func (u *ui) readForm() (job, error) {
@@ -229,6 +260,32 @@ func (u *ui) readForm() (job, error) {
 	if err != nil {
 		return job{}, err
 	}
+	j, err := u.readOutput()
+	if err != nil {
+		return job{}, err
+	}
+	j.dl = downloader.Config{
+		Base: u.base.Text, Template: u.tmpl.Text, Pad: pad,
+		Start: start, End: end, Workers: workers, Headers: headers,
+		PartsDir: strings.TrimSuffix(j.out, filepath.Ext(j.out)) + "_parts",
+	}
+	j.cleanup = u.cleanup.Checked
+	if end != downloader.NoEnd {
+		if end < start {
+			return job{}, errors.New("«по» меньше, чем «с»")
+		}
+		j.total = end - start + 1
+	}
+	if u.subsOn.Checked {
+		if j.subs, err = u.readSubs(j.ffmpeg); err != nil {
+			return job{}, err
+		}
+	}
+	return j, nil
+}
+
+// readOutput fills ffmpeg and the output .mp4 path.
+func (u *ui) readOutput() (job, error) {
 	ffmpeg, err := merge.FindFFmpeg(u.ffmpeg.Text)
 	if err != nil {
 		return job{}, err
@@ -244,25 +301,44 @@ func (u *ui) readForm() (job, error) {
 	if !strings.EqualFold(filepath.Ext(name), ".mp4") {
 		name += ".mp4"
 	}
-	base := strings.TrimSuffix(name, filepath.Ext(name))
+	return job{ffmpeg: ffmpeg, out: filepath.Join(dir, name)}, nil
+}
 
-	j := job{
-		dl: downloader.Config{
-			Base: u.base.Text, Template: u.tmpl.Text, Pad: pad,
-			Start: start, End: end, Workers: workers, Headers: headers,
-			PartsDir: filepath.Join(dir, base+"_parts"),
-		},
-		ffmpeg:  ffmpeg,
-		out:     filepath.Join(dir, name),
-		cleanup: u.cleanup.Checked,
+func (u *ui) readSubs(ffmpeg string) (*subs.Options, error) {
+	whisper, err := subs.FindWhisper(u.whisper.Text)
+	if err != nil {
+		return nil, err
 	}
-	if end != downloader.NoEnd {
-		if end < start {
-			return job{}, errors.New("«по» меньше, чем «с»")
+	model := strings.TrimSpace(u.model.Text)
+	if model == "" {
+		return nil, errors.New("укажите файл модели Whisper (например ggml-large-v3-turbo.bin)")
+	}
+	if st, err := os.Stat(model); err != nil || st.IsDir() {
+		return nil, fmt.Errorf("файл модели не найден: %s", model)
+	}
+	return &subs.Options{
+		FFmpeg: ffmpeg, Whisper: whisper, Model: model,
+		Lang: u.lang.Selected, Translate: u.translate.Checked,
+	}, nil
+}
+
+// onSubsOnly makes subtitles for an already downloaded mp4 (Папка + Файл).
+func (u *ui) onSubsOnly() {
+	j, err := u.readOutput()
+	if err == nil {
+		if _, statErr := os.Stat(j.out); statErr != nil {
+			err = fmt.Errorf("файл не найден: %s\nУкажите папку и имя готового mp4", j.out)
 		}
-		j.total = end - start + 1
 	}
-	return j, nil
+	if err == nil {
+		j.subs, err = u.readSubs(j.ffmpeg)
+	}
+	if err != nil {
+		dialog.ShowError(err, u.win)
+		return
+	}
+	j.only = true
+	u.run(j)
 }
 
 func (u *ui) onStart() {
@@ -286,10 +362,16 @@ func (u *ui) run(j job) {
 	ctx, cancel := context.WithCancel(context.Background())
 	u.cancel = cancel
 	u.startBtn.Disable()
+	u.subsBtn.Disable()
 	u.stopBtn.Enable()
 	u.logText.SetText("")
 	u.bar.SetValue(0)
-	if j.total > 0 {
+	if j.only {
+		u.bar.Max = 100
+		u.barInf.Stop()
+		u.barInf.Hide()
+		u.bar.Show()
+	} else if j.total > 0 {
 		u.bar.Max = float64(j.total)
 		u.barInf.Stop()
 		u.barInf.Hide()
@@ -299,8 +381,10 @@ func (u *ui) run(j job) {
 		u.barInf.Show()
 		u.barInf.Start()
 	}
-	u.status.SetText("Скачивание…")
-	u.log("Сегменты сохраняются в " + j.dl.PartsDir)
+	if !j.only {
+		u.status.SetText("Скачивание…")
+		u.log("Сегменты сохраняются в " + j.dl.PartsDir)
+	}
 
 	j.dl.OnSegment = func(done int) {
 		fyne.Do(func() {
@@ -318,13 +402,18 @@ func (u *ui) run(j job) {
 			cancel()
 			u.cancel = nil
 			u.startBtn.Enable()
+			u.subsBtn.Enable()
 			u.stopBtn.Disable()
 			u.barInf.Stop()
 			u.barInf.Hide()
 			u.bar.Show()
 			switch {
 			case errors.Is(err, context.Canceled):
-				u.status.SetText("Остановлено. Скачанные сегменты сохранены: при повторном старте загрузка продолжится.")
+				if j.only {
+					u.status.SetText("Остановлено")
+				} else {
+					u.status.SetText("Остановлено. Скачанные сегменты сохранены: при повторном старте загрузка продолжится.")
+				}
 				u.log("Остановлено пользователем")
 			case err != nil:
 				u.status.SetText("Ошибка")
@@ -341,6 +430,18 @@ func (u *ui) run(j job) {
 
 // work runs off the UI thread.
 func (u *ui) work(ctx context.Context, j job) error {
+	if !j.only {
+		if err := u.download(ctx, j); err != nil {
+			return err
+		}
+	}
+	if j.subs != nil {
+		return u.makeSubs(ctx, j)
+	}
+	return nil
+}
+
+func (u *ui) download(ctx context.Context, j job) error {
 	res, err := downloader.Run(ctx, j.dl)
 	if err != nil {
 		return err
@@ -357,5 +458,39 @@ func (u *ui) work(ctx context.Context, j job) error {
 			fyne.Do(func() { u.log("Не удалось удалить сегменты: " + err.Error()) })
 		}
 	}
+	return nil
+}
+
+// makeSubs runs Whisper on the whole merged video (not per segment, so phrases
+// are not cut at segment borders) and embeds the result as a subtitle track.
+func (u *ui) makeSubs(ctx context.Context, j job) error {
+	fyne.Do(func() {
+		u.log("Распознаю речь (Whisper), это может занять время…")
+		u.status.SetText("Распознавание речи: 0%")
+		u.barInf.Stop()
+		u.barInf.Hide()
+		u.bar.Max = 100
+		u.bar.SetValue(0)
+		u.bar.Show()
+	})
+	o := *j.subs
+	o.OnProgress = func(p int) {
+		fyne.Do(func() {
+			u.status.SetText(fmt.Sprintf("Распознавание речи: %d%%", p))
+			u.bar.SetValue(float64(p))
+		})
+	}
+	srt, err := subs.Generate(ctx, j.out, o)
+	if err != nil {
+		return err
+	}
+	fyne.Do(func() {
+		u.log("Субтитры: " + srt)
+		u.status.SetText("Вшиваю субтитры в mp4…")
+	})
+	if err := subs.Embed(ctx, j.ffmpeg, j.out, srt, subs.SubLang(o)); err != nil {
+		return err
+	}
+	fyne.Do(func() { u.log("Субтитры вшиты в mp4 (в VLC: клавиша V)") })
 	return nil
 }

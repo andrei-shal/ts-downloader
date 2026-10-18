@@ -44,11 +44,15 @@ func Merge(ctx context.Context, ffmpeg string, files []string, out string) error
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, ffmpeg,
-		"-hide_banner", "-loglevel", "error", "-y",
+	return RunFFmpeg(ctx, ffmpeg,
 		"-f", "concat", "-safe", "0", "-i", listPath,
 		"-c", "copy", "-movflags", "+faststart", out)
-	hideWindow(cmd)
+}
+
+// RunFFmpeg runs ffmpeg quietly (overwriting outputs) and returns its error output on failure.
+func RunFFmpeg(ctx context.Context, ffmpeg string, args ...string) error {
+	cmd := exec.CommandContext(ctx, ffmpeg, append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)...)
+	HideWindow(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
